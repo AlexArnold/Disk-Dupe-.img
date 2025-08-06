@@ -1,4 +1,4 @@
-  wddx32 help 
+  wddx32 help
   wddx32 list 
   wddx32 create    --disk 0  --output disk0.img                                               
   wddx32 create    --disk 0  --part   0        --output  part0.img                            
