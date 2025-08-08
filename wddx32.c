@@ -303,6 +303,7 @@ int crtPartImage(int driveNumber, int partitionNum, const char* outputPath) {
         }
 
         bytesToCopy -= bytesRead;
+        printf("\rProgress: %.2f MB", bytesToCopy / (1024.0 * 1024.0));
     }
 
     if (bytesToCopy > 0) {
@@ -776,57 +777,155 @@ int wrtImg_Disk_part(int driveNumber, int partitionNumber, const char* inputFile
 
 
 //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+void safe_print_string_at_offset(const BYTE* buf, DWORD bufSize, DWORD offset, char* out, size_t outSize) {
+    if (offset == 0 || offset >= bufSize) {
+        out[0] = '\0';
+        return;
+    }
+    size_t maxcopy = outSize - 1;
+    const char* src = (const char*)(buf + offset);
+    strncpy(out, src, maxcopy);
+    out[maxcopy] = '\0';
+}
+
 void list_disks() {
+    printf("----------------------------------------------------------\n");
     for (int i = 0; i < 32; i++) {
         char diskPath[64];
         sprintf(diskPath, "\\\\.\\PhysicalDrive%d", i);
 
-        HANDLE hDevice = CreateFileA(diskPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-        if (hDevice == INVALID_HANDLE_VALUE)
-            continue;
-
-        printf("----------------------------------------------------------\n");
         printf("PhysicalDrive #%d:\n", i);
 
-        BYTE buffer[1000] = {0};
-        STORAGE_PROPERTY_QUERY query = {0};
+        // Try to open device
+        HANDLE hDevice = CreateFileA(diskPath,
+                                     GENERIC_READ,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                     NULL,
+                                     OPEN_EXISTING,
+                                     0,
+                                     NULL);
+        if (hDevice == INVALID_HANDLE_VALUE) {
+            DWORD err = GetLastError();
+            printf("  Cannot open %s (error %lu).", diskPath, err);
+            if (err == ERROR_ACCESS_DENIED) {
+                printf(" Access denied (need admin?).");
+            }
+            printf("\n");
+            continue;
+        }
+
+        // 1) Try IOCTL_DISK_GET_DRIVE_GEOMETRY to "wake up" device (safe)
+        DISK_GEOMETRY dg;
+        DWORD bytesReturned = 0;
+        BOOL ok = DeviceIoControl(hDevice,
+                                  IOCTL_DISK_GET_DRIVE_GEOMETRY,
+                                  NULL, 0,
+                                  &dg, sizeof(dg),
+                                  &bytesReturned, NULL);
+        if (ok) {
+            unsigned long long diskSize = 0;
+            if (dg.BytesPerSector && dg.SectorsPerTrack && dg.TracksPerCylinder) {
+                // approximate size: Cylinders * Tracks * Sectors * BytesPerSector
+                // Note: Cylinders is LARGE_INTEGER.HighPart/LowPart in older headers; we use dg.Cylinders.QuadPart if available
+#ifdef _WIN64
+                diskSize = (unsigned long long)dg.Cylinders.QuadPart * dg.TracksPerCylinder * dg.SectorsPerTrack * dg.BytesPerSector;
+#else
+                // On some older MinGW headers Cylinders is LARGE_INTEGER; try to use Volume
+                diskSize = (unsigned long long)dg.Cylinders.u.LowPart * dg.TracksPerCylinder * dg.SectorsPerTrack * dg.BytesPerSector;
+#endif
+                printf("  Geometry: BytesPerSector=%lu, Sectors/Track=%lu, Tracks/Cyl=%lu\n",
+                       (unsigned long)dg.BytesPerSector,
+                       (unsigned long)dg.SectorsPerTrack,
+                       (unsigned long)dg.TracksPerCylinder);
+            } else {
+                printf("  Geometry: unavailable or unusual.\n");
+            }
+        } else {
+            // Not fatal — some devices/drivers don't support it. Continue.
+            // Don't print a long error to avoid clutter, but note it.
+            // printf("  IOCTL_DISK_GET_DRIVE_GEOMETRY failed: %lu\n", GetLastError());
+            printf("  Geometry: unavailable.\n");
+        }
+
+        // 2) Try to read first sector (MBR). This is a safe synchronous ReadFile.
+        BYTE sector[SECTOR_SIZE];
+        LARGE_INTEGER offset;
+        offset.QuadPart = 0;
+        if (!SetFilePointerEx(hDevice, offset, NULL, FILE_BEGIN)) {
+            printf("  SetFilePointerEx failed: %lu\n", GetLastError());
+        } else {
+            DWORD br = 0;
+            if (ReadFile(hDevice, sector, SECTOR_SIZE, &br, NULL) && br == SECTOR_SIZE) {
+                MBR* mbr = (MBR*)sector;
+                if (mbr->signature == 0xAA55) {
+                    printf("  Partition Table Type: MBR\n");
+                    for (int p = 0; p < 4; p++) {
+                        PARTITION_ENTRY* part = &mbr->partitions[p];
+                        if (part->totalSectors == 0) continue;
+                        unsigned long long offset_bytes = (unsigned long long)part->StartingLBA * SECTOR_SIZE;
+                        unsigned long long size_bytes = (unsigned long long)part->totalSectors * SECTOR_SIZE;
+                        unsigned long long size_mb = size_bytes / (1024ULL * 1024ULL);
+                        const char* fsType = get_fs_type_mbr(part->systemID);
+                        printf("    Partition %d: Offset = %llu bytes, Size = %llu MB, Type = %s (0x%02X)\n",
+                               p, offset_bytes, size_mb, fsType, part->systemID);
+                    }
+                } else {
+                    printf("  Partition Table Type: Unknown (no MBR signature)\n");
+                }
+            } else {
+                DWORD err = GetLastError();
+                printf("  Read MBR failed (error %lu). Device may be removable or not ready.\n", err);
+            }
+        }
+
+        // 3) Try IOCTL_STORAGE_QUERY_PROPERTY to get vendor/product/serial (best-effort)
+        // Prepare query
+        STORAGE_PROPERTY_QUERY query;
+        memset(&query, 0, sizeof(query));
         query.PropertyId = StorageDeviceProperty;
         query.QueryType = PropertyStandardQuery;
 
-        DWORD bytesReturned;
-        if (DeviceIoControl(hDevice, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), &buffer, sizeof(buffer), &bytesReturned, NULL)) {
-            STORAGE_DEVICE_DESCRIPTOR* desc = (STORAGE_DEVICE_DESCRIPTOR*)buffer;
-            char vendor[64] = "", product[64] = "", serial[64] = "";
-            if (desc->VendorIdOffset) strncpy(vendor, (char*)(buffer + desc->VendorIdOffset), sizeof(vendor) - 1);
-            if (desc->ProductIdOffset) strncpy(product, (char*)(buffer + desc->ProductIdOffset), sizeof(product) - 1);
-            if (desc->SerialNumberOffset) strncpy(serial, (char*)(buffer + desc->SerialNumberOffset), sizeof(serial) - 1);
-            printf("  Model: %s %s [%s]\n", vendor, product, serial);
-        }
-
-        BYTE sector[SECTOR_SIZE];
-        DWORD bytesRead;
-        if (ReadFile(hDevice, sector, SECTOR_SIZE, &bytesRead, NULL) && bytesRead == SECTOR_SIZE) {
-            MBR* mbr = (MBR*)sector;
-            if (mbr->signature == 0xAA55) {
-                printf("  Partition Table Type: MBR\n");
-                for (int p = 0; p < 4; p++) {
-                    PARTITION_ENTRY* part = &mbr->partitions[p];
-                    if (part->totalSectors == 0) continue;
-                    ULONGLONG offset_bytes = (ULONGLONG)part->StartingLBA * SECTOR_SIZE;
-                    ULONGLONG size_bytes = (ULONGLONG)part->totalSectors * SECTOR_SIZE;
-                    ULONGLONG size_mb = size_bytes / (1024 * 1024);
-                    const char* fsType = get_fs_type_mbr(part->systemID);
-                    printf("    Partition %d: Offset = %llu bytes, Size = %llu MB, Type = %s (0x%02X)\n",
-                           p, offset_bytes, size_mb, fsType, part->systemID);
+        // allocate a buffer for result (reasonable size)
+        DWORD outBufSize = 1024;
+        BYTE* outBuf = (BYTE*)malloc(outBufSize);
+        if (outBuf) {
+            memset(outBuf, 0, outBufSize);
+            DWORD ret = 0;
+            BOOL ok2 = DeviceIoControl(hDevice,
+                                       IOCTL_STORAGE_QUERY_PROPERTY,
+                                       &query, sizeof(query),
+                                       outBuf, outBufSize,
+                                       &ret, NULL);
+            if (ok2 && ret >= sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
+                STORAGE_DEVICE_DESCRIPTOR* desc = (STORAGE_DEVICE_DESCRIPTOR*)outBuf;
+                char vendor[128] = "", product[128] = "", serial[128] = "";
+                if (desc->VendorIdOffset && desc->VendorIdOffset < ret)
+                    safe_print_string_at_offset(outBuf, ret, desc->VendorIdOffset, vendor, sizeof(vendor));
+                if (desc->ProductIdOffset && desc->ProductIdOffset < ret)
+                    safe_print_string_at_offset(outBuf, ret, desc->ProductIdOffset, product, sizeof(product));
+                if (desc->SerialNumberOffset && desc->SerialNumberOffset < ret)
+                    safe_print_string_at_offset(outBuf, ret, desc->SerialNumberOffset, serial, sizeof(serial));
+                if (vendor[0] || product[0] || serial[0]) {
+                    printf("  Model: %s %s [%s]\n", vendor, product, serial);
+                } else {
+                    printf("  Model info: not available.\n");
                 }
             } else {
-                printf("  Partition Table Type: Unknown\n");
+                // Many devices simply don't support this or return small size on old XP drivers.
+                // Do not treat as fatal.
+                // printf("  IOCTL_STORAGE_QUERY_PROPERTY failed: %lu (ret=%lu)\n", GetLastError(), ret);
+                printf("  Model info: unavailable.\n");
             }
+            free(outBuf);
+        } else {
+            printf("  Memory alloc failed for storage descriptor.\n");
         }
+
         CloseHandle(hDevice);
+        printf("----------------------------------------------------------\n");
     }
-    printf("----------------------------------------------------------\n");
 }
+
 
 
 //============================================================================================================================
@@ -923,3 +1022,4 @@ int main(int argc, char* argv[]) {
 }
 
 //===end===
+
