@@ -10,4 +10,5 @@
  
 
 X:\VirtualBox.x64\VBoxManage.exe  convertfromraw    filename.img      filename.vhd    --format VHD
+
 X:\qemu_20250422\qemu-img.exe convert  -f raw    filename.img     -O vmdk    filename_img.vmdk
